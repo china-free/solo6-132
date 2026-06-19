@@ -1,6 +1,3 @@
-const acorn = require('acorn');
-const walk = require('acorn-walk');
-
 function parsePython(source, filePath = '') {
   try {
     const ast = parsePythonToEstree(source, filePath);
@@ -440,11 +437,11 @@ function buildAstFromTokens(tokens, lines, source) {
   function parseForStatement() {
     const startToken = expect('for');
     
-    let left = parseExpression();
+    let left = parsePrimaryExpression();
     
     while (peek() && peek().value === ',') {
       consume();
-      const next = parseExpression();
+      const next = parsePrimaryExpression();
       left = {
         type: 'SequenceExpression',
         expressions: [left, next],
@@ -612,8 +609,13 @@ function buildAstFromTokens(tokens, lines, source) {
   function parseBinaryExpression() {
     let left = parseUnaryExpression();
     
-    while (peek() && peek().type === 'Punctuator' && 
-           ['+', '-', '*', '/', '%', '==', '!=', '<', '>', '<=', '>=', 'and', 'or', 'in', 'is'].includes(peek().value)) {
+    const punctOps = ['+', '-', '*', '/', '%', '**', '//', '==', '!=', '<', '>', '<=', '>=', '|', '&', '^', '<<', '>>'];
+    const kwOps = ['and', 'or', 'in', 'is'];
+    
+    while (peek() && (
+      (peek().type === 'Punctuator' && punctOps.includes(peek().value)) ||
+      (peek().type === 'Keyword' && kwOps.includes(peek().value))
+    )) {
       const operator = consume();
       const right = parseUnaryExpression();
       
@@ -649,6 +651,44 @@ function buildAstFromTokens(tokens, lines, source) {
       };
     }
     return parsePrimaryExpression();
+  }
+  
+  function parseComprehensionClauses() {
+    const clauses = [];
+    while (peek() && (peek().value === 'for' || peek().value === 'if')) {
+      if (peek().value === 'for') {
+        const forToken = consume();
+        let target = parsePrimaryExpression();
+        while (peek() && peek().value === ',') {
+          consume();
+          const next = parsePrimaryExpression();
+          target = {
+            type: 'SequenceExpression',
+            expressions: [target, next],
+            loc: { start: target.loc.start, end: next.loc.end }
+          };
+        }
+        expect('in');
+        const iter = parseExpression();
+        clauses.push({
+          type: 'ComprehensionFor',
+          target,
+          iter,
+          loc: { start: forToken.loc.start, end: iter.loc.end },
+          range: [forToken.range[0], iter.range[1]]
+        });
+      } else {
+        const ifToken = consume();
+        const test = parseExpression();
+        clauses.push({
+          type: 'ComprehensionIf',
+          test,
+          loc: { start: ifToken.loc.start, end: test.loc.end },
+          range: [ifToken.range[0], test.range[1]]
+        });
+      }
+    }
+    return clauses;
   }
   
   function parsePrimaryExpression() {
@@ -825,99 +865,149 @@ function buildAstFromTokens(tokens, lines, source) {
     }
     
     if (token.value === '[') {
-      consume();
-      const elements = [];
+      const openToken = consume();
+      
+      if (peek() && peek().value === ']') {
+        const closeToken = consume();
+        return {
+          type: 'ArrayExpression',
+          elements: [],
+          loc: { start: openToken.loc.start, end: closeToken.loc.end },
+          range: [openToken.range[0], closeToken.range[1]]
+        };
+      }
+      
+      const firstExpr = parseExpression();
+      
+      if (peek() && peek().value === 'for') {
+        const clauses = parseComprehensionClauses();
+        const closeToken = expect(']');
+        return {
+          type: 'ComprehensionExpression',
+          kind: 'list',
+          body: firstExpr,
+          clauses,
+          loc: {
+            start: openToken.loc.start,
+            end: closeToken.loc.end
+          },
+          range: [openToken.range[0], closeToken.range[1]]
+        };
+      }
+      
+      const elements = [firstExpr];
       while (peek() && peek().value !== ']') {
         if (peek().value === ',') {
           consume();
+          if (peek() && peek().value === ']') break;
           continue;
         }
         elements.push(parseExpression());
       }
-      expect(']');
+      const closeToken = expect(']');
       return {
         type: 'ArrayExpression',
         elements,
         loc: {
-          start: token.loc.start,
-          end: token.loc.end
+          start: openToken.loc.start,
+          end: closeToken.loc.end
         },
-        range: [token.range[0], token.range[1]]
+        range: [openToken.range[0], closeToken.range[1]]
       };
     }
     
     if (token.value === '{') {
       const openBrace = consume();
-      const properties = [];
-      while (peek() && peek().value !== '}') {
-        if (peek().value === ',') {
-          consume();
-          continue;
-        }
-        
-        let key;
-        const nextToken = peek();
-        if (nextToken && (nextToken.type === 'StringLiteral' || nextToken.type === 'NumericLiteral' || nextToken.type === 'Identifier')) {
-          const keyToken = consume();
-          if (keyToken.type === 'StringLiteral') {
-            key = {
-              type: 'StringLiteral',
-              value: keyToken.value,
-              loc: keyToken.loc,
-              range: keyToken.range
-            };
-          } else if (keyToken.type === 'NumericLiteral') {
-            key = {
-              type: 'NumericLiteral',
-              value: keyToken.value,
-              raw: keyToken.raw,
-              loc: keyToken.loc,
-              range: keyToken.range
-            };
-          } else {
-            key = {
-              type: 'Identifier',
-              name: keyToken.value,
-              loc: keyToken.loc,
-              range: keyToken.range
-            };
-          }
-        } else {
-          key = parseExpression();
-        }
-        
-        if (!peek() || peek().value !== ':') {
-          break;
-        }
+      
+      if (peek() && peek().value === '}') {
+        const closeToken = expect('}');
+        return {
+          type: 'ObjectExpression',
+          properties: [],
+          loc: { start: openBrace.loc.start, end: closeToken.loc.end },
+          range: [openBrace.range[0], closeToken.range[1]]
+        };
+      }
+      
+      const firstExpr = parseExpression();
+      
+      if (peek() && peek().value === ':') {
         expect(':');
+        const firstValue = parseExpression();
         
-        const value = parseExpression();
+        if (peek() && peek().value === 'for') {
+          const clauses = parseComprehensionClauses();
+          const closeToken = expect('}');
+          return {
+            type: 'ComprehensionExpression',
+            kind: 'dict',
+            key: firstExpr,
+            value: firstValue,
+            clauses,
+            loc: { start: openBrace.loc.start, end: closeToken.loc.end },
+            range: [openBrace.range[0], closeToken.range[1]]
+          };
+        }
         
-        if (key && value) {
+        const properties = [{
+          type: 'ObjectProperty',
+          key: firstExpr,
+          value: firstValue,
+          loc: { start: firstExpr.loc.start, end: firstValue.loc.end }
+        }];
+        while (peek() && peek().value !== '}') {
+          if (peek().value === ',') {
+            consume();
+            if (peek() && peek().value === '}') break;
+            continue;
+          }
+          const key = parseExpression();
+          expect(':');
+          const value = parseExpression();
           properties.push({
             type: 'ObjectProperty',
             key,
             value,
-            loc: {
-              start: key.loc.start,
-              end: value.loc.end
-            }
+            loc: { start: key.loc.start, end: value.loc.end }
           });
         }
+        const closeToken = expect('}');
+        return {
+          type: 'ObjectExpression',
+          properties,
+          loc: { start: openBrace.loc.start, end: closeToken.loc.end },
+          range: [openBrace.range[0], closeToken.range[1]]
+        };
       }
       
-      if (peek() && peek().value === '}') {
-        expect('}');
+      if (peek() && peek().value === 'for') {
+        const clauses = parseComprehensionClauses();
+        const closeToken = expect('}');
+        return {
+          type: 'ComprehensionExpression',
+          kind: 'set',
+          body: firstExpr,
+          clauses,
+          loc: { start: openBrace.loc.start, end: closeToken.loc.end },
+          range: [openBrace.range[0], closeToken.range[1]]
+        };
       }
       
+      const elements = [firstExpr];
+      while (peek() && peek().value !== '}') {
+        if (peek().value === ',') {
+          consume();
+          if (peek() && peek().value === '}') break;
+          continue;
+        }
+        elements.push(parseExpression());
+      }
+      const closeToken = expect('}');
       return {
-        type: 'ObjectExpression',
-        properties,
-        loc: {
-          start: openBrace.loc.start,
-          end: openBrace.loc.end
-        },
-        range: [openBrace.range[0], openBrace.range[1]]
+        type: 'SetExpression',
+        elements,
+        loc: { start: openBrace.loc.start, end: closeToken.loc.end },
+        range: [openBrace.range[0], closeToken.range[1]]
       };
     }
     

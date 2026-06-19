@@ -161,7 +161,7 @@ function tokenizeGo(source) {
     const operators = [
       ':=', '==', '!=', '<=', '>=', '->', '+=', '-=', '*=', '/=', '%=',
       '&=', '|=', '^=', '<<=', '>>=', '&^=',
-      '&&', '||', '<<', '>>', '&^', '++', '--',
+      '&&', '||', '<<', '>>', '&^', '++', '--', '<-',
       '+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '!', '=', ':'
     ];
     
@@ -281,6 +281,8 @@ function buildAstFromTokens(tokens, lines, source) {
           return parseReturnStatement();
         case 'switch':
           return parseSwitchStatement();
+        case 'select':
+          return parseSelectStatement();
         case 'break':
         case 'continue':
         case 'fallthrough':
@@ -375,16 +377,22 @@ function buildAstFromTokens(tokens, lines, source) {
     const startToken = expect('type');
     const name = consume();
     
+    let nodeType = 'TypeAlias';
+    let body = null;
+    let endToken = name;
+    
     if (peek() && peek().value === 'struct') {
-      consume();
-      if (peek() && peek().value === '{') {
-        parseBlock();
-      }
+      const structToken = consume();
+      nodeType = 'StructDeclaration';
+      const result = parseStructBody();
+      body = result.fields;
+      endToken = result.endToken;
     } else if (peek() && peek().value === 'interface') {
-      consume();
-      if (peek() && peek().value === '{') {
-        parseBlock();
-      }
+      const ifaceToken = consume();
+      nodeType = 'InterfaceDeclaration';
+      const result = parseInterfaceBody();
+      body = result.methods;
+      endToken = result.endToken;
     } else {
       while (peek() && peek().value !== ';' && peek().loc.start.line === startToken.loc.start.line) {
         consume();
@@ -394,19 +402,168 @@ function buildAstFromTokens(tokens, lines, source) {
     if (peek() && peek().value === ';') consume();
     
     return {
-      type: 'TypeAlias',
+      type: nodeType,
       id: {
         type: 'Identifier',
         name: name.value,
         loc: name.loc,
         range: name.range
       },
+      body,
       loc: {
         start: startToken.loc.start,
-        end: name.loc.end
+        end: endToken.loc.end
       },
-      range: [startToken.range[0], name.range[1]]
+      range: [startToken.range[0], endToken.range[1]]
     };
+  }
+  
+  function parseStructBody() {
+    const fields = [];
+    let endToken = null;
+    if (peek() && peek().value === '{') {
+      const openBrace = consume();
+      while (peek() && peek().value !== '}') {
+        const fieldStart = peek();
+        let names = [];
+        if (peek() && peek().type === 'Identifier' && peek().value !== '{' && peek().value !== '}') {
+          names.push(consume());
+          while (peek() && peek().value === ',') {
+            consume();
+            if (peek() && peek().type === 'Identifier') names.push(consume());
+          }
+        }
+        let fieldType = null;
+        if (peek() && peek().value !== '`' && peek().value !== '}' && peek().loc.start.line === fieldStart.loc.start.line) {
+          fieldType = parseTypeReference();
+        }
+        let tag = null;
+        if (peek() && peek().type === 'StringLiteral') {
+          tag = consume().value;
+        }
+        fields.push({
+          type: 'FieldDeclaration',
+          names: names.map(n => ({ type: 'Identifier', name: n.value, loc: n.loc, range: n.range })),
+          fieldType,
+          tag,
+          loc: { start: fieldStart.loc.start, end: (tag ? peek(-1) : (fieldType ? fieldType : names[names.length-1])).loc.end }
+        });
+      }
+      if (peek() && peek().value === '}') {
+        endToken = consume();
+      } else {
+        endToken = openBrace;
+      }
+    }
+    if (!endToken) endToken = peek(-1) || { loc: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, range: [0, 0] };
+    return { fields, endToken };
+  }
+  
+  function parseInterfaceBody() {
+    const methods = [];
+    let endToken = null;
+    if (peek() && peek().value === '{') {
+      const openBrace = consume();
+      while (peek() && peek().value !== '}') {
+        const methodStart = peek();
+        let name = null;
+        if (peek() && peek().type === 'Identifier') {
+          name = consume();
+        }
+        let params = [];
+        let results = [];
+        if (peek() && peek().value === '(') {
+          params = parseParameterList();
+        }
+        if (peek() && peek().value !== '}' && peek().loc.start.line === methodStart.loc.start.line) {
+          results = parseResultList();
+        }
+        methods.push({
+          type: 'MethodSignature',
+          key: name ? { type: 'Identifier', name: name.value, loc: name.loc, range: name.range } : null,
+          params,
+          results,
+          loc: { start: methodStart.loc.start, end: (peek(-1) || methodStart).loc.end }
+        });
+      }
+      if (peek() && peek().value === '}') {
+        endToken = consume();
+      } else {
+        endToken = openBrace;
+      }
+    }
+    if (!endToken) endToken = peek(-1) || { loc: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, range: [0, 0] };
+    return { methods, endToken };
+  }
+  
+  function parseTypeReference() {
+    const startToken = peek();
+    if (!startToken) return null;
+    const isBracket = startToken.value === '[' && peek(1) && peek(1).value === ']';
+    if (startToken.value === '*' || isBracket || startToken.value === 'chan' ||
+        startToken.value === 'map' || startToken.value === 'func' || startToken.value === '<-' ||
+        startToken.value === 'interface' || startToken.value === 'struct') {
+      const kw = isBracket ? (consume(), consume()) : consume();
+      const kwVal = isBracket ? '[]' : kw.value;
+      let elementType = null;
+      if (kwVal === '*') {
+        elementType = parseTypeReference();
+      } else if (kwVal === 'chan') {
+        elementType = parseTypeReference();
+      } else if (kwVal === '<-') {
+        if (peek() && peek().value === 'chan') { consume(); elementType = parseTypeReference(); }
+      } else if (kwVal === '[]') {
+        elementType = parseTypeReference();
+      } else if (kwVal === 'map') {
+        if (peek() && peek().value === '[') { consume(); parseTypeReference(); if (peek() && peek().value === ']') consume(); }
+        elementType = parseTypeReference();
+      } else if (kwVal === 'func') {
+        if (peek() && peek().value === '(') { parseParameterList(); }
+        if (peek() && peek().value === '(') { parseParameterList(); }
+      } else if (kwVal === 'interface' || kwVal === 'struct') {
+        if (peek() && peek().value === '{') { parseBlock(); }
+      }
+      const lastTok = peek(-1) || kw;
+      return {
+        type: kwVal === '*' ? 'PointerType' : kwVal === 'chan' ? 'ChannelType' :
+              kwVal === '[]' ? 'ArrayType' : kwVal === 'map' ? 'MapType' :
+              kwVal === 'func' ? 'FunctionType' : 'TypeReference',
+        elementType,
+        loc: { start: startToken.loc.start, end: lastTok.loc.end },
+        range: [startToken.range[0], lastTok.range[1]]
+      };
+    }
+    const nameToken = consume();
+    return {
+      type: 'NamedType',
+      name: nameToken.value,
+      loc: nameToken.loc,
+      range: nameToken.range
+    };
+  }
+  
+  function parseParameterList() {
+    const params = [];
+    if (!peek() || peek().value !== '(') return params;
+    consume();
+    while (peek() && peek().value !== ')') {
+      if (peek().value === ',') { consume(); continue; }
+      if (peek().value === '.') {
+        while (peek() && peek().value !== ')') consume();
+        break;
+      }
+      parseTypeReference();
+      params.push({ type: 'Parameter' });
+    }
+    if (peek() && peek().value === ')') consume();
+    return params;
+  }
+  
+  function parseResultList() {
+    if (peek() && peek().value === '(') {
+      return parseParameterList();
+    }
+    return [parseTypeReference()].filter(Boolean);
   }
   
   function parseFunctionDeclaration() {
@@ -669,6 +826,62 @@ function buildAstFromTokens(tokens, lines, source) {
     };
   }
   
+  function parseSelectStatement() {
+    const startToken = expect('select');
+    
+    let openBrace = null;
+    if (peek() && peek().value === '{') {
+      openBrace = consume();
+    }
+    
+    const cases = [];
+    let endToken = openBrace || startToken;
+    while (peek() && peek().value !== '}') {
+      if (peek().value === 'case' || peek().value === 'default') {
+        const caseKw = consume();
+        let comm = null;
+        if (caseKw.value === 'case') {
+          comm = parseExpression();
+        }
+        if (peek() && peek().value === ':') consume();
+        
+        const caseBody = [];
+        while (peek() && peek().value !== 'case' && peek().value !== 'default' && peek().value !== '}') {
+          const stmt = parseStatement();
+          if (stmt) caseBody.push(stmt);
+        }
+        
+        cases.push({
+          type: 'SelectCase',
+          test: comm,
+          consequent: caseBody,
+          loc: {
+            start: caseKw.loc.start,
+            end: caseBody.length > 0 ? caseBody[caseBody.length - 1].loc.end : caseKw.loc.end
+          }
+        });
+        endToken = cases[cases.length - 1];
+      } else {
+        consume();
+      }
+    }
+    
+    if (peek() && peek().value === '}') {
+      endToken = consume();
+    }
+    if (peek() && peek().value === ';') consume();
+    
+    return {
+      type: 'SelectStatement',
+      cases,
+      loc: {
+        start: startToken.loc.start,
+        end: endToken.loc.end
+      },
+      range: [startToken.range[0], endToken.range[1]]
+    };
+  }
+  
   function parseReturnStatement() {
     const startToken = expect('return');
     const argument = [];
@@ -715,7 +928,7 @@ function buildAstFromTokens(tokens, lines, source) {
     let left = parseUnaryExpression();
     
     while (peek() && peek().type === 'Punctuator' && 
-           ['+', '-', '*', '/', '%', '==', '!=', '<', '>', '<=', '>=', '&&', '||', '&', '|', '^', '<<', '>>', '&^'].includes(peek().value)) {
+           ['+', '-', '*', '/', '%', '==', '!=', '<', '>', '<=', '>=', '&&', '||', '&', '|', '^', '<<', '>>', '&^', '<-'].includes(peek().value)) {
       const operator = consume();
       const right = parseUnaryExpression();
       
@@ -821,23 +1034,50 @@ function buildAstFromTokens(tokens, lines, source) {
             range: [node.range[0], token.range[1]]
           };
         } else if (peek().value === '[') {
-          consume();
-          let index = null;
-          if (peek() && peek().value !== ']') {
-            index = parseExpression();
+          const openBracket = consume();
+          let low = null, high = null, hasColon = false;
+          if (peek() && peek().value !== ':' && peek().value !== ']') {
+            low = parseExpression();
           }
-          expect(']');
-          node = {
-            type: 'MemberExpression',
-            object: node,
-            property: index || { type: 'Identifier', name: '' },
-            computed: true,
-            loc: {
-              start: node.loc.start,
-              end: token.loc.end
-            },
-            range: [node.range[0], token.range[1]]
-          };
+          if (peek() && peek().value === ':') {
+            consume();
+            hasColon = true;
+            if (peek() && peek().value !== ':' && peek().value !== ']') {
+              high = parseExpression();
+            }
+          }
+          let closeToken = openBracket;
+          if (peek() && peek().value === ']') {
+            closeToken = consume();
+          } else {
+            while (peek() && peek().value !== ']') consume();
+            if (peek() && peek().value === ']') closeToken = consume();
+          }
+          if (hasColon) {
+            node = {
+              type: 'SliceExpression',
+              object: node,
+              low,
+              high,
+              loc: {
+                start: node.loc.start,
+                end: closeToken.loc.end
+              },
+              range: [node.range[0], closeToken.range[1]]
+            };
+          } else {
+            node = {
+              type: 'MemberExpression',
+              object: node,
+              property: low || { type: 'Identifier', name: '' },
+              computed: true,
+              loc: {
+                start: node.loc.start,
+                end: closeToken.loc.end
+              },
+              range: [node.range[0], closeToken.range[1]]
+            };
+          }
         } else if (peek().value === '.') {
           consume();
           const prop = consume();
