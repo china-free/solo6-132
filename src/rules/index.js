@@ -1,6 +1,7 @@
 const { traverseAst: traverseJS } = require('../parsers/javascript');
 const { traverseAst: traversePy } = require('../parsers/python');
 const { traverseAst: traverseGo } = require('../parsers/go');
+const { createFixer } = require('./fix-kit');
 
 const longFunctionRule = require('./long-function');
 const deepNestingRule = require('./deep-nesting');
@@ -13,6 +14,8 @@ const DEFAULT_RULES = [
   deadCodeRule,
   magicNumberRule
 ];
+
+const REQUIRED_ISSUE_FIELDS = ['rule', 'message', 'line'];
 
 class RuleEngine {
   constructor(config = {}) {
@@ -31,33 +34,42 @@ class RuleEngine {
   }
 
   loadRules(ruleNames = null) {
-    const rulesToLoad = ruleNames 
+    const rulesToLoad = ruleNames
       ? DEFAULT_RULES.filter(r => ruleNames.includes(r.meta.name))
       : DEFAULT_RULES;
-    
+
     rulesToLoad.forEach(rule => this.registerRule(rule));
   }
 
   run(ast, source, language, filePath, config = {}) {
     const issues = [];
+    const engine = this;
+    const fixer = createFixer();
+
     const context = {
       source,
       language,
       filePath,
       config: { ...this.config, ...config },
-      report: (issue) => {
-        issues.push({
-          ...issue,
-          filePath,
-          language,
-          source: this.getSourceSnippet(source, issue.line, issue.endLine || issue.line)
-        });
+      report(issue) {
+        const validated = engine.validateIssue(issue, language, filePath);
+        if (validated.fix && typeof validated.fix === 'function') {
+          validated.fixable = true;
+        }
+        issues.push(validated);
       },
-      getSourceSnippet: (line, endLine) => this.getSourceSnippet(source, line, endLine)
+      getSource() { return source; },
+      nodeRange(node) {
+        if (Array.isArray(node.range) && node.range.length === 2) return node.range;
+        if (node.start != null && node.end != null) return [node.start, node.end];
+        return null;
+      },
+      getSourceSnippet: (line, endLine) => engine.getSourceSnippet(source, line, endLine),
+      createFixer: () => createFixer()
     };
 
     const traverse = this.getTraverser(language);
-    
+
     let astToTraverse = ast;
     if ((language === 'javascript' || language === 'typescript') && ast.type === 'File' && ast.program) {
       astToTraverse = ast.program;
@@ -68,7 +80,10 @@ class RuleEngine {
         if (rule.meta.supportedLanguages && !rule.meta.supportedLanguages.includes(language)) {
           return;
         }
-        const visitors = rule.create(context);
+        const created = rule.create(context);
+        const visitors = created && created.visitors ? created.visitors : created;
+        const finalize = created && typeof created.finalize === 'function' ? created.finalize : null;
+
         if (traverse && visitors) {
           try {
             traverse(astToTraverse, visitors);
@@ -76,15 +91,45 @@ class RuleEngine {
             console.warn(`⚠️  遍历 AST 时出错: ${e.message}`);
           }
         }
+        if (finalize) {
+          try {
+            finalize(context);
+          } catch (e) {
+            console.warn(`⚠️  规则 finalize 出错 (${rule.meta.name}): ${e.message}`);
+          }
+        }
       } else if (typeof rule === 'function') {
         const result = rule(ast, source, language, context);
         if (Array.isArray(result)) {
-          issues.push(...result);
+          issues.push(...result.map(i => this.validateIssue(i, language, filePath)));
         }
       }
     });
 
+    issues.forEach(issue => {
+      if (!issue.source) {
+        issue.source = this.getSourceSnippet(source, issue.line, issue.endLine || issue.line);
+      }
+    });
+
     return issues;
+  }
+
+  validateIssue(issue, language, filePath) {
+    if (!issue || typeof issue !== 'object') {
+      throw new Error('context.report 需要一个 issue 对象');
+    }
+    for (const field of REQUIRED_ISSUE_FIELDS) {
+      if (issue[field] === undefined || issue[field] === null) {
+        throw new Error(`issue 缺少必填字段: ${field}`);
+      }
+    }
+    return {
+      ...issue,
+      filePath,
+      language,
+      fixable: issue.fixable === undefined ? (typeof issue.fix === 'function') : issue.fixable
+    };
   }
 
   getTraverser(language) {
@@ -105,7 +150,7 @@ class RuleEngine {
     const lines = source.split('\n');
     const actualStart = Math.max(1, startLine - contextLines);
     const actualEnd = Math.min(lines.length, endLine + contextLines);
-    
+
     return {
       lines: lines.slice(actualStart - 1, actualEnd).map((content, i) => ({
         line: actualStart + i,

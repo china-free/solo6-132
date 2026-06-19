@@ -54,16 +54,19 @@ async function analyzeProject(targetPath, config = {}) {
 async function fixProject(targetPath, config = {}) {
   const result = await analyzeProject(targetPath, config);
   const fixes = applyFixes(result.issues, config);
-  
+
+  let totalIssuesFixed = 0;
   for (const fix of fixes) {
     try {
       fs.writeFileSync(fix.file, fix.newContent, 'utf-8');
+      totalIssuesFixed += fix.issuesFixed || 0;
     } catch (error) {
       console.warn(`⚠️  写入文件失败 ${fix.file}:`, error.message);
     }
   }
 
-  result.fixedCount = fixes.length;
+  result.fixedCount = totalIssuesFixed;
+  result.fixedFiles = fixes.length;
   return result;
 }
 

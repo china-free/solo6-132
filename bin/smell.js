@@ -36,7 +36,7 @@ program
         console.log('\n🔧 正在分析并自动修复代码坏味道...\n');
         const result = await fixProject(absolutePath, config);
         printReport(result, config);
-        console.log(`\n✅ 自动修复完成！共修复 ${result.fixedCount} 个问题。`);
+        console.log(`\n✅ 自动修复完成！共修复 ${result.fixedCount} 个问题（涉及 ${result.fixedFiles || 0} 个文件）。`);
       } else {
         console.log('\n🔍 正在扫描代码坏味道...\n');
         const result = await analyzeProject(absolutePath, config);

@@ -1,5 +1,6 @@
 const chalk = require('chalk');
 const path = require('path');
+const { describeOp, createFixer } = require('./rules/fix-kit');
 
 const SEVERITY_COLORS = {
   error: chalk.red,
@@ -133,7 +134,20 @@ function printIssueDetail(issue, index) {
   }
   
   if (issue.fixable) {
-    console.log(`     ${chalk.green('🔧 可自动修复:')} 使用 --fix 参数自动修复此问题`);
+    let fixDesc = '使用 --fix 参数自动修复';
+    if (typeof issue.fix === 'function') {
+      try {
+        const ops = issue.fix(createFixer());
+        const opsArr = Array.isArray(ops) ? ops : (ops ? [ops] : []);
+        if (opsArr.length > 0) {
+          const opsText = opsArr.map(describeOp).join('; ');
+          fixDesc = opsText;
+        }
+      } catch (e) {
+        fixDesc = `修复指令生成失败: ${e.message}`;
+      }
+    }
+    console.log(`     ${chalk.green('🔧 可自动修复:')} ${chalk.gray(fixDesc)}`);
   }
 }
 
@@ -178,6 +192,7 @@ function printJsonReport(result) {
       endLine: issue.endLine,
       column: issue.column,
       fixable: issue.fixable,
+      hasFix: typeof issue.fix === 'function',
       details: issue.details
     }))
   };
@@ -191,7 +206,7 @@ function printSummary(issues) {
   console.log(chalk.cyan('='.repeat(80)));
   
   const byFile = groupBy(issues, 'filePath');
-  const fixableCount = issues.filter(i => i.fixable).length;
+  const fixableCount = issues.filter(i => i.fixable && typeof i.fix === 'function').length;
   
   console.log(`\n  涉及文件: ${chalk.yellow(Object.keys(byFile).length)} 个`);
   console.log(`  可自动修复: ${chalk.green(fixableCount)} 个问题`);

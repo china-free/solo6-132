@@ -1,115 +1,11 @@
 const fs = require('fs');
 const path = require('path');
-
-function applyFixes(issues, config = {}) {
-  const fixableIssues = issues.filter(issue => issue.fixable && issue.rule === 'magic-number');
-  
-  const fixesByFile = {};
-  
-  fixableIssues.forEach(issue => {
-    if (!fixesByFile[issue.filePath]) {
-      fixesByFile[issue.filePath] = [];
-    }
-    fixesByFile[issue.filePath].push(issue);
-  });
-  
-  const results = [];
-  
-  Object.entries(fixesByFile).forEach(([filePath, fileIssues]) => {
-    const fixResult = fixMagicNumbers(filePath, fileIssues, config);
-    if (fixResult) {
-      results.push(fixResult);
-    }
-  });
-  
-  return results;
-}
-
-function fixMagicNumbers(filePath, issues, config) {
-  const source = fs.readFileSync(filePath, 'utf-8');
-  const ext = path.extname(filePath).toLowerCase();
-  const language = getLanguageFromExtension(ext);
-  
-  const uniqueValues = new Map();
-  
-  issues.forEach(issue => {
-    const value = issue.details?.value;
-    const raw = issue.details?.raw;
-    if (value !== undefined && raw !== undefined) {
-      if (!uniqueValues.has(raw)) {
-        uniqueValues.set(raw, {
-          value,
-          raw,
-          suggestedName: issue.details?.suggestedConstantName || generateConstantName(value)
-        });
-      }
-    }
-  });
-  
-  if (uniqueValues.size === 0) return null;
-  
-  let newContent = source;
-  const usedNames = new Set();
-  const constantsToAdd = [];
-  
-  uniqueValues.forEach((info, raw) => {
-    let constName = info.suggestedName;
-    
-    let counter = 1;
-    while (usedNames.has(constName)) {
-      constName = `${info.suggestedName}_${counter}`;
-      counter++;
-    }
-    usedNames.add(constName);
-    
-    info.actualName = constName;
-    
-    const regex = createNumberRegex(raw);
-    
-    let match;
-    const matches = [];
-    while ((match = regex.exec(newContent)) !== null) {
-      const beforeChar = match.index > 0 ? newContent[match.index - 1] : '';
-      const afterChar = match.index + match[0].length < newContent.length 
-        ? newContent[match.index + match[0].length] 
-        : '';
-      
-      if (!isPartOfIdentifier(beforeChar) && !isPartOfIdentifier(afterChar)) {
-        matches.push({
-          index: match.index,
-          length: match[0].length,
-          raw: match[0]
-        });
-      }
-    }
-    
-    for (let i = matches.length - 1; i >= 0; i--) {
-      const m = matches[i];
-      newContent = newContent.slice(0, m.index) + constName + newContent.slice(m.index + m.length);
-    }
-    
-    constantsToAdd.push({
-      name: constName,
-      value: info.raw
-    });
-  });
-  
-  const constantDeclarations = generateConstantDeclarations(constantsToAdd, language);
-  
-  const insertPosition = findInsertPosition(newContent, language);
-  
-  if (insertPosition >= 0) {
-    newContent = newContent.slice(0, insertPosition) + constantDeclarations + newContent.slice(insertPosition);
-  }
-  
-  return {
-    file: filePath,
-    oldContent: source,
-    newContent,
-    issues,
-    constantsAdded: constantsToAdd
-  };
-}
+const {
+  createFixer,
+  applyFixesToSource,
+  validateOp,
+  describeOp
+} = require('./rules/fix-kit');
 
 function getLanguageFromExtension(ext) {
   const map = {
@@ -120,122 +16,105 @@ function getLanguageFromExtension(ext) {
     '.py': 'python',
     '.go': 'go'
   };
-  return map[ext] || 'javascript';
+  return map[ext.toLowerCase()] || 'javascript';
 }
 
-function generateConstantName(value) {
-  const absValue = Math.abs(value);
-  const suffix = value < 0 ? '_NEGATIVE' : '';
-  
-  if (Number.isInteger(absValue)) {
-    return `MAGIC_${absValue}${suffix}`;
-  } else {
-    const strValue = absValue.toString().replace('.', '_');
-    return `MAGIC_${strValue}${suffix}`;
+function collectFixOps(issue, fixer) {
+  if (typeof issue.fix !== 'function') return [];
+  let ops;
+  try {
+    ops = issue.fix(fixer);
+  } catch (e) {
+    console.warn(`⚠️  规则 ${issue.rule} 的 fix 回调抛出异常: ${e.message}`);
+    return [];
   }
+  if (!ops) return [];
+  return Array.isArray(ops) ? ops : [ops];
 }
 
-function createNumberRegex(raw) {
-  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?<!\\w)${escaped}(?!\\w)`, 'g');
+function applyFixes(issues, config = {}) {
+  const fixableIssues = issues.filter(issue => issue.fixable && typeof issue.fix === 'function');
+
+  const fixesByFile = {};
+  fixableIssues.forEach(issue => {
+    if (!fixesByFile[issue.filePath]) fixesByFile[issue.filePath] = [];
+    fixesByFile[issue.filePath].push(issue);
+  });
+
+  const results = [];
+
+  Object.entries(fixesByFile).forEach(([filePath, fileIssues]) => {
+    const result = applyFixesToFile(filePath, fileIssues);
+    if (result) results.push(result);
+  });
+
+  return results;
 }
 
-function isPartOfIdentifier(char) {
-  return /[a-zA-Z0-9_$]/.test(char);
-}
+function applyFixesToFile(filePath, issues) {
+  let source;
+  try {
+    source = fs.readFileSync(filePath, 'utf-8');
+  } catch (e) {
+    console.warn(`⚠️  无法读取文件 ${filePath}: ${e.message}`);
+    return null;
+  }
 
-function generateConstantDeclarations(constants, language) {
-  const lines = [];
-  
-  switch (language) {
-    case 'javascript':
-    case 'typescript':
-      constants.forEach(c => {
-        lines.push(`const ${c.name} = ${c.value};`);
+  const ext = path.extname(filePath);
+  const language = getLanguageFromExtension(ext);
+  const fixer = createFixer();
+
+  const allOps = [];
+  const opDescriptions = [];
+  let appliedIssueCount = 0;
+
+  issues.forEach(issue => {
+    const ops = collectFixOps(issue, fixer);
+    if (ops.length === 0) return;
+
+    try {
+      ops.forEach(op => {
+        validateOp(op);
+        allOps.push(op);
       });
-      break;
-      
-    case 'python':
-      constants.forEach(c => {
-        lines.push(`${c.name} = ${c.value}`);
+      opDescriptions.push({
+        rule: issue.rule,
+        message: issue.message,
+        line: issue.line,
+        ops: ops.map(describeOp)
       });
-      break;
-      
-    case 'go':
-      if (constants.length > 0) {
-        lines.push('const (');
-        constants.forEach(c => {
-          lines.push(`\t${c.name} = ${c.value}`);
-        });
-        lines.push(')');
-      }
-      break;
-      
-    default:
-      constants.forEach(c => {
-        lines.push(`const ${c.name} = ${c.value};`);
-      });
-  }
-  
-  return '\n' + lines.join('\n') + '\n\n';
-}
+      appliedIssueCount++;
+    } catch (e) {
+      console.warn(`⚠️  跳过非法修复指令 (${issue.rule} @ ${filePath}:${issue.line}): ${e.message}`);
+    }
+  });
 
-function findInsertPosition(content, language) {
-  const lines = content.split('\n');
-  
-  let importEndLine = -1;
-  let inMultiLineImport = false;
-  
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    
-    if (language === 'python') {
-      if (line.startsWith('import ') || line.startsWith('from ')) {
-        importEndLine = i;
-      }
-    } else if (language === 'javascript' || language === 'typescript') {
-      if (line.startsWith('import ') || line.startsWith('const {') && line.includes('from ')) {
-        importEndLine = i;
-      }
-      if (line.includes('from ') && line.endsWith(';')) {
-        importEndLine = i;
-      }
-    } else if (language === 'go') {
-      if (line.startsWith('import ') && line.includes('(')) {
-        inMultiLineImport = true;
-      }
-      if (inMultiLineImport && line === ')') {
-        inMultiLineImport = false;
-        importEndLine = i;
-      }
-      if (line.startsWith('import ') && !line.includes('(')) {
-        importEndLine = i;
-      }
-      if (line.startsWith('package ')) {
-        importEndLine = i;
-      }
-    }
+  if (allOps.length === 0) return null;
+
+  let newContent;
+  try {
+    newContent = applyFixesToSource(source, allOps);
+  } catch (e) {
+    console.warn(`⚠️  应用修复指令失败 (${filePath}): ${e.message}`);
+    return null;
   }
-  
-  if (importEndLine >= 0) {
-    let pos = 0;
-    for (let i = 0; i <= importEndLine; i++) {
-      pos += lines[i].length + 1;
-    }
-    return pos;
-  }
-  
-  if (language === 'go') {
-    const packageMatch = content.match(/^package\s+\w+\s*/);
-    if (packageMatch) {
-      return packageMatch[0].length;
-    }
-  }
-  
-  return 0;
+
+  if (newContent === source) return null;
+
+  return {
+    file: filePath,
+    language,
+    oldContent: source,
+    newContent,
+    issues,
+    fixOperations: opDescriptions,
+    opsCount: allOps.length,
+    issuesFixed: appliedIssueCount
+  };
 }
 
 module.exports = {
   applyFixes,
-  fixMagicNumbers
+  applyFixesToFile,
+  collectFixOps
 };

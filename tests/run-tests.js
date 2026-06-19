@@ -3,6 +3,12 @@ const path = require('path');
 const { analyzeProject, fixProject } = require('../src/index');
 const { parseFile } = require('../src/parsers');
 const { runRules } = require('../src/rules');
+const {
+  createFixer,
+  applyFixesToSource,
+  validateOp,
+  describeOp
+} = require('../src/rules/fix-kit');
 
 const chalk = require('chalk');
 
@@ -208,7 +214,7 @@ console.log(usedFunc());
       const fixableIssues = result.issues.filter(i => i.fixable);
       assert(fixableIssues.length > 0, '应有可修复的问题');
       fixableIssues.forEach(issue => {
-        assert(issue.rule === 'magic-number', '只有 magic-number 问题可修复');
+        assert(typeof issue.fix === 'function', `可修复问题必须携带 fix 函数 (rule=${issue.rule})`);
       });
     });
 
@@ -219,6 +225,129 @@ console.log(usedFunc());
 
   console.log(chalk.bold('\n📝 自动修复测试'));
   console.log(chalk.gray('-'.repeat(60)));
+
+  test('FixOperation 构建器生成合法对象', () => {
+    const fixer = createFixer();
+    const replaceOp = fixer.replaceTextRange(5, 10, 'CONST');
+    assert(replaceOp.type === 'replace', 'replaceTextRange 应产出 type=replace');
+    assert(Array.isArray(replaceOp.range) && replaceOp.range.length === 2, 'replace 应带 range 数组');
+    assert(replaceOp.text === 'CONST', 'replace 应带 text');
+
+    const insertOp = fixer.insertAt(20, '\nconst X = 1;\n');
+    assert(insertOp.type === 'insert', 'insertAt 应产出 type=insert');
+    assert(typeof insertOp.offset === 'number', 'insert 应带 offset');
+    assert(typeof insertOp.text === 'string', 'insert 应带 text');
+
+    const fakeNode = { range: [30, 35] };
+    const removeOp = fixer.remove(fakeNode);
+    assert(removeOp.type === 'remove', 'remove 应产出 type=remove');
+    assert(removeOp.range[0] === 30 && removeOp.range[1] === 35, 'remove 应使用 node.range');
+
+    const afterOp = fixer.insertTextAfter(fakeNode, ' // 后置注释');
+    assert(afterOp.type === 'insert' && afterOp.offset === 35, 'insertTextAfter 应使用 range[1]');
+
+    const beforeOp = fixer.insertTextBefore(fakeNode, '// 前置注释\n');
+    assert(beforeOp.type === 'insert' && beforeOp.offset === 30, 'insertTextBefore 应使用 range[0]');
+  });
+
+  test('FixOperation 校验器拒绝非法指令', () => {
+    const fixer = createFixer();
+    let threw = false;
+    try { validateOp({ type: 'unknown' }); } catch (e) { threw = true; }
+    assert(threw, '未知类型应被拒绝');
+
+    threw = false;
+    try { validateOp({ type: 'replace', range: [10, 5], text: 'x' }); } catch (e) { threw = true; }
+    assert(threw, 'replace range 起始大于结束应被拒绝');
+
+    threw = false;
+    try { validateOp({ type: 'insert', offset: 'abc', text: 'x' }); } catch (e) { threw = true; }
+    assert(threw, 'insert offset 非数字应被拒绝');
+
+    threw = false;
+    try { fixer.replaceTextRange('a', 5, 'x'); } catch (e) { threw = true; }
+    assert(threw, 'replaceTextRange 参数类型错误应抛出');
+  });
+
+  test('applyFixesToSource 按偏移降序应用且检测重叠', () => {
+    const source = '0123456789ABCDEFGHIJ';
+    const fixer = createFixer();
+    const ops = [
+      fixer.replaceTextRange(0, 2, 'XX'),
+      fixer.replaceTextRange(5, 7, 'YY')
+    ];
+    const result = applyFixesToSource(source, ops);
+    assert(result === 'XX234YY789ABCDEFGHIJ', `降序应用后应得到预期文本，实际: ${result}`);
+
+    const overlapOps = [
+      fixer.replaceTextRange(0, 5, 'XXX'),
+      fixer.replaceTextRange(3, 8, 'YYY')
+    ];
+    const overlapResult = applyFixesToSource(source, overlapOps);
+    assert(overlapResult.includes('YYY') && !overlapResult.includes('XXX'), `默认模式应跳过重叠指令，实际: ${overlapResult}`);
+
+    let threw = false;
+    try { applyFixesToSource(source, overlapOps, { strict: true }); } catch (e) { threw = true; }
+    assert(threw, '严格模式下重叠范围应抛出错误');
+  });
+
+  test('describeOp 生成可读描述', () => {
+    const fixer = createFixer();
+    const desc = describeOp(fixer.replaceTextRange(10, 15, 'CONST'));
+    assert(desc.includes('replaceTextRange') && desc.includes('10') && desc.includes('15'), 'describeOp 应包含类型与范围');
+
+    const insertDesc = describeOp(fixer.insertAt(0, 'const X = 1;'));
+    assert(insertDesc.includes('insertAt') && insertDesc.includes('0'), 'describeOp 应描述 insert');
+
+    const removeDesc = describeOp(fixer.remove({ range: [3, 6] }));
+    assert(removeDesc.includes('remove'), 'describeOp 应描述 remove');
+  });
+
+  test('magic-number issue 的 fix 回调产出合法 FixOperation', () => {
+    const code = `function calc() {\n  return 42;\n}`;
+    const ast = parseFile(code, 'javascript', 'test.js');
+    const issues = runRules(ast, code, 'javascript', 'test.js', {});
+    const magicIssues = issues.filter(i => i.rule === 'magic-number' && i.fix);
+    assert(magicIssues.length > 0, '魔法数字应携带 fix 回调');
+
+    const fixer = createFixer();
+    let hasReplace = false;
+    let hasInsert = false;
+    magicIssues.forEach(issue => {
+      const ops = issue.fix(fixer);
+      const opsArr = Array.isArray(ops) ? ops : [ops];
+      opsArr.forEach(op => {
+        validateOp(op);
+        assert(op.type === 'replace' || op.type === 'insert', `魔法数字修复应为 replace 或 insert 类型，实际: ${op.type}`);
+        if (op.type === 'replace') {
+          assert(op.range[0] < op.range[1], 'range 合法');
+          hasReplace = true;
+        } else {
+          hasInsert = true;
+        }
+      });
+    });
+    assert(hasReplace, '应至少有一个 replace 类型修复（替换魔法数字）');
+    assert(hasInsert, '应至少有一个 insert 类型修复（插入常量声明）');
+  });
+
+  test('dead-code issue 的 fix 回调产出 remove 类型指令', () => {
+    const code = `const unused = 42;\nconst used = unused + 1;\nconsole.log(used);\n`;
+    const ast = parseFile(code, 'javascript', 'test.js');
+    const issues = runRules(ast, code, 'javascript', 'test.js', {});
+    const deadIssues = issues.filter(i => i.rule === 'dead-code' && i.fix);
+    if (deadIssues.length > 0) {
+      const fixer = createFixer();
+      deadIssues.forEach(issue => {
+        const ops = issue.fix(fixer);
+        const opsArr = Array.isArray(ops) ? ops : [ops];
+        opsArr.forEach(op => {
+          validateOp(op);
+          assert(op.type === 'remove' || op.type === 'replace', '死代码修复应为 remove 或 replace');
+        });
+      });
+    }
+  });
 
   test('自动修复能提取魔法数字为常量', async () => {
     const testFile = path.join(TEST_DIR, 'fix-test.js');
@@ -240,6 +369,12 @@ module.exports = { calc };
       const fixableCount = result.issues.filter(i => i.fixable).length;
       assert(fixableCount > 0, '应有可修复的魔法数字');
       
+      const fixResults = await fixProject(testFile, {});
+      assert(fixResults.length > 0, '应产生修复结果');
+
+      const fixedContent = fs.readFileSync(testFile, 'utf-8');
+      const hasConstantDecl = /const\s+\w+\s*=\s*100;/.test(fixedContent) || /const\s+\(/.test(fixedContent) || /\bPERCENT\b|\bMAGIC_/.test(fixedContent);
+      assert(hasConstantDecl, `修复后应包含常量声明，实际内容: ${fixedContent.slice(0, 200)}`);
     } finally {
       if (fs.existsSync(testFile)) {
         fs.unlinkSync(testFile);
