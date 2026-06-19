@@ -1,0 +1,29 @@
+{
+  "name": "code-smell-detector",
+  "version": "1.0.0",
+  "description": "基于 AST 的多语言脏代码检测与坏味道重构 CLI 工具",
+  "bin": {
+    "smell": "./bin/smell.js"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node tests/run-tests.js",
+    "lint": "node bin/smell.js tests/samples"
+  },
+  "keywords": ["ast", "code-quality", "static-analysis", "code-smell"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0",
+    "@babel/generator": "^7.24.0",
+    "@babel/types": "^7.24.0",
+    "chalk": "^4.1.2",
+    "commander": "^12.0.0",
+    "glob": "^10.3.10",
+    "python-ast": "^0.1.0",
+    "acorn": "^8.11.3",
+    "acorn-walk": "^8.3.2",
+    "typescript": "^5.4.0"
+  }
+}
